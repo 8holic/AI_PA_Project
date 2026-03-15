@@ -1,25 +1,32 @@
-import tkinter as tk
-from tkinter import simpledialog, ttk, messagebox
 import sqlite3
 import os
 import threading
 import ollama
+import tkinter as tk
+
+from module_loader import load_modules
+from app_core import App
+from ui.main_window import MainWindow
 
 # -----------------------------
-# MODEL & SYSTEM PROMPT
+# MODEL
 # -----------------------------
-model = "dolphin-mixtral"
+model = "llama3:8b"
 
-# Load system prompt from a text file
+# -----------------------------
+# SYSTEM PROMPT
+# -----------------------------
 prompt_file = os.path.join(os.path.dirname(__file__), "system_prompt.txt")
+
 try:
     with open(prompt_file, "r", encoding="utf-8") as f:
         SYSTEM_PROMPT = f.read().strip()
 except FileNotFoundError:
-    SYSTEM_PROMPT = "You are a helpful assistant. Answer politely and concisely."
-print("Loaded system prompt:", SYSTEM_PROMPT)
+    SYSTEM_PROMPT = "You are a helpful assistant."
+print(SYSTEM_PROMPT)
+
 # -----------------------------
-# DATABASE SETUP (thread-safe)
+# DATABASE
 # -----------------------------
 if not os.path.exists("Conversation_History"):
     os.makedirs("Conversation_History")
@@ -44,17 +51,26 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT
 )
 """)
+
 conn.commit()
 
-# -----------------------------
-# GLOBAL STATE
-# -----------------------------
 conversation_id = None
 messages = []
 
+app = App()
+load_modules(app)
+
 # -----------------------------
-# DATABASE HELPERS
+# AI FUNCTION
 # -----------------------------
+def ask_ai():
+    full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+    response = ollama.chat(
+        model=model,
+        messages=full_messages
+    )
+    return response["message"]["content"]
+
 def get_conversations():
     cursor.execute("SELECT name FROM conversations")
     rows = cursor.fetchall()
@@ -62,186 +78,113 @@ def get_conversations():
 
 def load_conversation(name):
     global conversation_id, messages
-    chat_box.delete("1.0", tk.END)
 
     cursor.execute("SELECT id FROM conversations WHERE name=?", (name,))
     row = cursor.fetchone()
     if not row:
-        return
+        return False
+
     conversation_id = row[0]
 
     cursor.execute(
-        "SELECT role, content FROM messages WHERE conversation_id=?",
+        "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id",
         (conversation_id,)
     )
     rows = cursor.fetchall()
+
     messages = []
 
-    # add system prompt
+    # include system prompt in messages but don't show in UI
     messages.append({"role": "system", "content": SYSTEM_PROMPT})
 
+    # clear chat box and show user + assistant messages
+    ui.clear_chat()
     for role, content in rows:
         messages.append({"role": role, "content": content})
         if role == "user":
-            chat_box.insert(tk.END, "You: " + content + "\n")
+            ui.chat_box.insert(tk.END, "You: " + content + "\n")
         else:
-            chat_box.insert(tk.END, "AI: " + content + "\n\n")
+            ui.chat_box.insert(tk.END, "AI: " + content + "\n\n")
+    ui.chat_box.see(tk.END)
+    return True
 
-def save_message(role, text):
-    cursor.execute(
-        "INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)",
-        (conversation_id, role, text)
-    )
-    conn.commit()
-
-# -----------------------------
-# NEW CONVERSATION
-# -----------------------------
 def new_conversation():
+    from tkinter import simpledialog, messagebox
     name = simpledialog.askstring("New Conversation", "Conversation name:")
     if not name:
         return
-
     cursor.execute("INSERT OR IGNORE INTO conversations (name) VALUES (?)", (name,))
     conn.commit()
-    refresh_dropdown()
+    refresh_conversations()
+    ui.select_conversation(name)
     load_conversation(name)
-    selected_conversation.set(name)
 
-# -----------------------------
-# DELETE CONVERSATION
-# -----------------------------
-def delete_conversation():
-    global conversation_id, messages
-    name = selected_conversation.get()
+def delete_conversation(name):
+    from tkinter import messagebox
     if not name:
         return
-    
     confirm = messagebox.askyesno("Delete Conversation", f"Are you sure you want to delete '{name}'?")
     if not confirm:
         return
-
-    # delete messages
-    cursor.execute(
-        "DELETE FROM messages WHERE conversation_id = (SELECT id FROM conversations WHERE name=?)",
-        (name,)
-    )
-    # delete conversation
-    cursor.execute(
-        "DELETE FROM conversations WHERE name=?",
-        (name,)
-    )
+    cursor.execute("DELETE FROM messages WHERE conversation_id = (SELECT id FROM conversations WHERE name=?)", (name,))
+    cursor.execute("DELETE FROM conversations WHERE name=?", (name,))
     conn.commit()
+    refresh_conversations()
+    # Clear chat if deleted conversation was current
+    if ui.conv_listbox.curselection():
+        selected_name = ui.conv_listbox.get(ui.conv_listbox.curselection()[0])
+        if selected_name == name:
+            ui.clear_chat()
 
-    # reset UI
-    messages = []
-    conversation_id = None
-    chat_box.delete("1.0", tk.END)
-    refresh_dropdown()
-
-    # select first conversation if any remain
-    conversations = get_conversations()
-    if conversations:
-        select_conversation(conversations[0])
-    else:
-        selected_conversation.set("")
-
+def refresh_conversations():
+    convs = get_conversations()
+    ui.set_conversations(convs)
+    # Optionally auto-select first conversation if none selected
+    if convs and not ui.conv_listbox.curselection():
+        ui.select_conversation(convs[0])
+        load_conversation(convs[0])
+    
 # -----------------------------
-# DROPDOWN HANDLING
+# UI CALLBACKS
 # -----------------------------
-def refresh_dropdown():
-    menu = dropdown["menu"]
-    menu.delete(0, "end")
-    for conv in get_conversations():
-        menu.add_command(
-            label=conv,
-            command=lambda value=conv: select_conversation(value)
-        )
+def send_message(user_text, ui):
+    global messages
 
-def select_conversation(name):
-    selected_conversation.set(name)
-    load_conversation(name)
+    # Disable user input while waiting
+    ui.entry.config(state="disabled")
+    ui.send_button.config(state="disabled")
 
-# -----------------------------
-# AI HANDLER WITH THREADING
-# -----------------------------
-def send_message():
-    if conversation_id is None:
-        return
-
-    user_text = entry.get()
-    entry.delete(0, tk.END)
-
-    chat_box.insert(tk.END, "You: " + user_text + "\n")
     messages.append({"role": "user", "content": user_text})
-    save_message("user", user_text)
 
-    spinner.start()
-    thread = threading.Thread(target=run_ai, args=(user_text,))
-    thread.start()
+    user_text = app.run_hook("before_send", user_text)
 
-def run_ai(user_text):
-    response = ollama.chat(
-        model=model,
-        messages=messages
-    )
-    ai_text = response["message"]["content"]
+    def run():
+        ai_text = ask_ai()
 
-    messages.append({"role": "assistant", "content": ai_text})
-    save_message("assistant", ai_text)
+        messages.append({"role": "assistant", "content": ai_text})
 
-    root.after(0, lambda: finish_ai(ai_text))
+        ai_text = app.run_hook("after_response", ai_text)
 
-def finish_ai(ai_text):
-    spinner.stop()
-    chat_box.insert(tk.END, "AI: " + ai_text + "\n\n")
+        def finish():
+            ui.show_ai(ai_text)
+            # Re-enable user input
+            ui.entry.config(state="normal")
+            ui.send_button.config(state="normal")
+            # Optional: put focus back in the entry
+            ui.entry.focus()
 
-# -----------------------------
-# GUI
-# -----------------------------
-root = tk.Tk()
-root.title("Local Assistant")
-root.geometry("800x600")
-root.minsize(600, 400)
+        ui.root.after(0, finish)
 
-# --- Top bar
-top_bar = tk.Frame(root)
-top_bar.pack(fill=tk.X, pady=5, padx=5)
-
-selected_conversation = tk.StringVar()
-dropdown = tk.OptionMenu(top_bar, selected_conversation, "")
-dropdown.pack(side=tk.LEFT, padx=5)
-
-new_button = tk.Button(top_bar, text="New Chat", command=new_conversation)
-new_button.pack(side=tk.LEFT, padx=5)
-
-delete_button = tk.Button(top_bar, text="Delete Chat", command=delete_conversation)
-delete_button.pack(side=tk.LEFT, padx=5)
-
-# --- Chat window
-chat_box = tk.Text(root)
-chat_box.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-# --- Spinner
-spinner = ttk.Progressbar(root, mode="indeterminate")
-spinner.pack(pady=5, padx=5, fill=tk.X)
-
-# --- Input bar
-bottom = tk.Frame(root)
-bottom.pack(fill=tk.X, pady=5, padx=5)
-
-entry = tk.Entry(bottom)
-entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-
-send_button = tk.Button(bottom, text="Send", command=send_message)
-send_button.pack(side=tk.LEFT, padx=5)
+    threading.Thread(target=run).start()
 
 # -----------------------------
-# INITIAL LOAD
+# START UI
 # -----------------------------
-refresh_dropdown()
-conversations = get_conversations()
-if conversations:
-    select_conversation(conversations[0])
+ui = MainWindow(send_message, {
+    "on_select": lambda name: load_conversation(name),
+    "on_new": new_conversation,
+    "on_delete": delete_conversation,
+})
 
-root.mainloop()
+refresh_conversations()  # populate the left panel
+ui.run()

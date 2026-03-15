@@ -1,0 +1,8 @@
+# Ignore Python virtual environment
+.venv/
+
+# Ignore conversation history folder
+Conversation_History/
+
+# Ignore system prompt file
+system_prompt.txt
